@@ -277,10 +277,19 @@ func (c *CacheApp) RunApp() {
 // NewCacheApp returns a new instance of CacheApp by applying the specified config params.
 func NewCacheApp(params *ConfigParams) (*CacheApp, error) {
 	c := &CacheApp{params: params, kubednsConfig: options.NewKubeDNSConfig()}
+	//Accept raw ip as upstreamsvc
+	c.clusterDNSIP = net.ParseIP(params.UpstreamSvcName)
+	if c.clusterDNSIP == nil {
+		clog.Warningf("Input upstreamsvc is not a ip address, continue parsing it")
+	} else {
+		return c, nil
+	}
+	//See if upstreamsvc is svc in the same ns
 	c.clusterDNSIP = net.ParseIP(os.ExpandEnv(toSvcEnv(params.UpstreamSvcName)))
 	if c.clusterDNSIP == nil {
-		clog.Warningf("Unable to lookup IP address of Upstream service %s, env %s `%s`", params.UpstreamSvcName, toSvcEnv(params.UpstreamSvcName), os.ExpandEnv(toSvcEnv(params.UpstreamSvcName)))
+		clog.Fatalf("Unable to lookup IP address of Upstream service %s, env %s `%s`", params.UpstreamSvcName, toSvcEnv(params.UpstreamSvcName), os.ExpandEnv(toSvcEnv(params.UpstreamSvcName)))
 	}
+
 	return c, nil
 }
 
