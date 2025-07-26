@@ -26,6 +26,7 @@ func periodicHostsUpdate(h *Hosts) chan bool {
 
 	go func() {
 		ticker := time.NewTicker(h.options.reload)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-parseChan:
@@ -95,11 +96,10 @@ func hostsParse(c *caddy.Controller) (Hosts, error) {
 			}
 			s, err := os.Stat(h.path)
 			if err != nil {
-				if os.IsNotExist(err) {
-					log.Warningf("File does not exist: %s", h.path)
-				} else {
+				if !os.IsNotExist(err) {
 					return h, c.Errf("unable to access hosts file '%s': %v", h.path, err)
 				}
+				log.Warningf("File does not exist: %s", h.path)
 			}
 			if s != nil && s.IsDir() {
 				log.Warningf("Hosts file %q is a directory", h.path)

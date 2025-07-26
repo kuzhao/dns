@@ -15,7 +15,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty)
 REGISTRY ?= gcr.io/k8s-staging-dns
 ARCH ?= amd64
-DNSMASQ_VERSION ?= dnsmasq-2.88
+DNSMASQ_VERSION ?= dnsmasq-2.90
 CONTAINER_PREFIX ?= k8s-dns
 
 ALL_ARCH := amd64 arm arm64 ppc64le s390x
@@ -28,10 +28,10 @@ OUTPUT_DIR := _output/$(ARCH)
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
 # Multiarch image
-# Uploaded: Jun 2, 2023, 12:57:53 PM
-BASEIMAGE ?= gcr.io/distroless/base-debian11@sha256:73deaaf6a207c1a33850257ba74e0f196bc418636cada9943a03d7abea980d6d
+# Uploaded: May 19, 2025
+BASEIMAGE ?= gcr.io/distroless/base-debian12@sha256:cef75d12148305c54ef5769e6511a5ac3c820f39bf5c8a4fbfd5b76b4b8da843
 ifeq ($(ARCH),amd64)
-	COMPILE_IMAGE := registry.k8s.io/build-image/debian-base-$(ARCH):bullseye-v1.4.1
+	COMPILE_IMAGE := registry.k8s.io/build-image/debian-base-$(ARCH):bookworm-v1.0.4
 else ifeq ($(ARCH),arm)
 	TRIPLE    ?= arm-linux-gnueabihf
 	QEMUARCH  := arm
@@ -50,16 +50,17 @@ endif
 
 DNSMASQ_URL := http://www.thekelleys.org.uk/dnsmasq/$(DNSMASQ_VERSION).tar.xz
 # SHA-256 computed from GPG-verified download:
-# $ gpg --recv 15CDDA6AE19135A2
+# $ gpg --recv-keys --keyserver keyring.debian.org D6EACBD6EE46B834248D111215CDDA6AE19135A2
 # ...
-# $ gpg --verify dnsmasq-2.88.tar.xz.asc dnsmasq-2.88.tar.xz
-# gpg: Signature made Sun 04 Dec 2022 10:04:50 PM UTC
-# gpg:                using RSA key D6EACBD6EE46B834248D111215CDDA6AE19135A2
-# gpg: Good signature from "Simon Kelley <simon@thekelleys.org.uk>" [unknown]
-# gpg:                 aka "Simon Kelley <srk@debian.org>" [unknown]
+# $ gpg --verify dnsmasq-2.90.tar.xz.asc dnsmasq-2.90.tar.xz
+# $ gpg: Signature made Tue 13 Feb 2024 01:50:43 PM UTC
+# $ gpg:                using RSA key D6EACBD6EE46B834248D111215CDDA6AE19135A2
+# $ gpg: Good signature from "Simon Kelley <simon@thekelleys.org.uk>" [unknown]
+# $ gpg:                 aka "Simon Kelley <srk@debian.org>" [unknown]
+# $ gpg: WARNING: This key is not certified with a trusted signature!
 # ...
-# $ sha256sum dnsmasq-2.88.tar.xz
-DNSMASQ_SHA256 := 23544deda10340c053bea6f15a93fed6ea7f5aaa85316bfc671ffa6d22fbc1b3
+# $ sha256sum dnsmasq-2.90.tar.xz
+DNSMASQ_SHA256 := 8e50309bd837bfec9649a812e066c09b6988b73d749b7d293c06c57d46a109e4
 DNSMASQ_ARCHIVE := $(OUTPUT_DIR)/dnsmasq.tar.xz
 
 MULTIARCH_CONTAINER := multiarch/qemu-user-static:register

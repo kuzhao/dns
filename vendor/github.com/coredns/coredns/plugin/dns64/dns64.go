@@ -36,7 +36,7 @@ type DNS64 struct {
 func (d *DNS64) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	// Don't proxy if we don't need to.
 	if !d.requestShouldIntercept(&request.Request{W: w, Req: r}) {
-		return d.Next.ServeDNS(ctx, w, r)
+		return plugin.NextOrFailure(d.Name(), d.Next, ctx, w, r)
 	}
 
 	// Pass the request to the next plugin in the chain, but intercept the response.
@@ -62,7 +62,7 @@ func (d *DNS64) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) 
 
 	RequestsTranslatedCount.WithLabelValues(metrics.WithServer(ctx)).Inc()
 	w.WriteMsg(msg)
-	return msg.MsgHdr.Rcode, nil
+	return msg.Rcode, nil
 }
 
 // Name implements the Handler interface.

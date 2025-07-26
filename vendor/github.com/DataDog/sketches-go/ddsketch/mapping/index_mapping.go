@@ -24,9 +24,12 @@ type IndexMapping interface {
 	Value(index int) float64
 	LowerBound(index int) float64
 	RelativeAccuracy() float64
+	// MinIndexableValue returns the minimum positive value that can be mapped to an index.
 	MinIndexableValue() float64
+	// MaxIndexableValue returns the maximum positive value that can be mapped to an index.
 	MaxIndexableValue() float64
 	ToProto() *sketchpb.IndexMapping
+	EncodeProto(builder *sketchpb.IndexMappingBuilder)
 	// Encode encodes a mapping and appends its content to the provided []byte.
 	Encode(b *[]byte)
 }
@@ -37,6 +40,9 @@ func NewDefaultMapping(relativeAccuracy float64) (IndexMapping, error) {
 
 // FromProto returns an Index mapping from the protobuf definition of it
 func FromProto(m *sketchpb.IndexMapping) (IndexMapping, error) {
+	if m == nil {
+		return nil, errors.New("cannot create IndexMapping from nil protobuf index mapping")
+	}
 	switch m.Interpolation {
 	case sketchpb.IndexMapping_NONE:
 		return NewLogarithmicMappingWithGamma(m.Gamma, m.IndexOffset)

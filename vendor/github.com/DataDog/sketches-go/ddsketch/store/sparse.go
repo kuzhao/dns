@@ -136,9 +136,10 @@ func (s *SparseStore) KeyAtRank(rank float64) int {
 }
 
 func (s *SparseStore) MergeWith(store Store) {
-	for bin := range store.Bins() {
-		s.AddBin(bin)
-	}
+	store.ForEach(func(index int, count float64) (stop bool) {
+		s.AddWithCount(index, count)
+		return false
+	})
 }
 
 func (s *SparseStore) ToProto() *sketchpb.Store {
@@ -147,6 +148,16 @@ func (s *SparseStore) ToProto() *sketchpb.Store {
 		binCounts[int32(index)] = count
 	}
 	return &sketchpb.Store{BinCounts: binCounts}
+}
+
+func (s *SparseStore) EncodeProto(builder *sketchpb.StoreBuilder) {
+
+	for index, count := range s.counts {
+		builder.AddBinCounts(func(w *sketchpb.Store_BinCountsEntryBuilder) {
+			w.SetKey(int32(index))
+			w.SetValue(count)
+		})
+	}
 }
 
 func (s *SparseStore) Reweight(w float64) error {

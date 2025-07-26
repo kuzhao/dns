@@ -18,8 +18,12 @@ import (
 )
 
 var (
-	errEmptySketch error = errors.New("no such element exists")
-	errUnknownFlag error = errors.New("unknown encoding flag")
+	ErrUntrackableNaN     = errors.New("input value is NaN and cannot be tracked by the sketch")
+	ErrUntrackableTooLow  = errors.New("input value is too low and cannot be tracked by the sketch")
+	ErrUntrackableTooHigh = errors.New("input value is too high and cannot be tracked by the sketch")
+	ErrNegativeCount      = errors.New("count cannot be negative")
+	errEmptySketch        = errors.New("no such element exists")
+	errUnknownFlag        = errors.New("unknown encoding flag")
 )
 
 // Unexported to prevent usage and avoid the cost of dynamic dispatch
@@ -27,7 +31,10 @@ type quantileSketch interface {
 	RelativeAccuracy() float64
 	IsEmpty() bool
 	GetCount() float64
+	GetZeroCount() float64
 	GetSum() float64
+	GetPositiveValueStore() store.Store
+	GetNegativeValueStore() store.Store
 	GetMinValue() (float64, error)
 	GetMaxValue() (float64, error)
 	GetValueAtQuantile(quantile float64) (float64, error)
@@ -49,11 +56,9 @@ var _ quantileSketch = (*DDSketchWithExactSummaryStatistics)(nil)
 
 type DDSketch struct {
 	mapping.IndexMapping
-	positiveValueStore        store.Store
-	negativeValueStore        store.Store
-	zeroCount                 float64
-	minIndexableAbsoluteValue float64
-	maxIndexableValue         float64
+	positiveValueStore store.Store
+	negativeValueStore store.Store
+	zeroCount          float64
 }
 
 func NewDDSketchFromStoreProvider(indexMapping mapping.IndexMapping, storeProvider store.Provider) *DDSketch {
@@ -62,11 +67,9 @@ func NewDDSketchFromStoreProvider(indexMapping mapping.IndexMapping, storeProvid
 
 func NewDDSketch(indexMapping mapping.IndexMapping, positiveValueStore store.Store, negativeValueStore store.Store) *DDSketch {
 	return &DDSketch{
-		IndexMapping:              indexMapping,
-		positiveValueStore:        positiveValueStore,
-		negativeValueStore:        negativeValueStore,
-		minIndexableAbsoluteValue: indexMapping.MinIndexableValue(),
-		maxIndexableValue:         indexMapping.MaxIndexableValue(),
+		IndexMapping:       indexMapping,
+		positiveValueStore: positiveValueStore,
+		negativeValueStore: negativeValueStore,
 	}
 }
 
@@ -119,17 +122,22 @@ func (s *DDSketch) Add(value float64) error {
 
 // Adds a value to the sketch with a float64 count.
 func (s *DDSketch) AddWithCount(value, count float64) error {
-	if value < -s.maxIndexableValue || value > s.maxIndexableValue {
-		return errors.New("The input value is outside the range that is tracked by the sketch.")
-	}
 	if count < 0 {
-		return errors.New("The count cannot be negative.")
+		return ErrNegativeCount
 	}
 
-	if value > s.minIndexableAbsoluteValue {
+	if value > s.MinIndexableValue() {
+		if value > s.MaxIndexableValue() {
+			return ErrUntrackableTooHigh
+		}
 		s.positiveValueStore.AddWithCount(s.Index(value), count)
-	} else if value < -s.minIndexableAbsoluteValue {
+	} else if value < -s.MinIndexableValue() {
+		if value < -s.MaxIndexableValue() {
+			return ErrUntrackableTooLow
+		}
 		s.negativeValueStore.AddWithCount(s.Index(-value), count)
+	} else if math.IsNaN(value) {
+		return ErrUntrackableNaN
 	} else {
 		s.zeroCount += count
 	}
@@ -139,12 +147,10 @@ func (s *DDSketch) AddWithCount(value, count float64) error {
 // Return a (deep) copy of this sketch.
 func (s *DDSketch) Copy() *DDSketch {
 	return &DDSketch{
-		IndexMapping:              s.IndexMapping,
-		positiveValueStore:        s.positiveValueStore.Copy(),
-		negativeValueStore:        s.negativeValueStore.Copy(),
-		zeroCount:                 s.zeroCount,
-		minIndexableAbsoluteValue: s.minIndexableAbsoluteValue,
-		maxIndexableValue:         s.maxIndexableValue,
+		IndexMapping:       s.IndexMapping,
+		positiveValueStore: s.positiveValueStore.Copy(),
+		negativeValueStore: s.negativeValueStore.Copy(),
+		zeroCount:          s.zeroCount,
 	}
 }
 
@@ -167,7 +173,13 @@ func (s *DDSketch) GetValueAtQuantile(quantile float64) (float64, error) {
 		return math.NaN(), errEmptySketch
 	}
 
-	rank := quantile * (count - 1)
+	// Use an explicit floating point conversion (as per Go specification) to make sure that no
+	// "fused multiply and add" (FMA) operation is used in the following code subtracting values
+	// from `rank`. Not doing so can lead to inconsistent rounding and return value for this
+	// function, depending on the architecture and whether FMA operations are used or not by the
+	// compiler.
+	rank := float64(quantile * (count - 1))
+
 	negativeValueCount := s.negativeValueStore.TotalCount()
 	if rank < negativeValueCount {
 		return -s.Value(s.negativeValueStore.KeyAtRank(negativeValueCount - 1 - rank)), nil
@@ -195,6 +207,13 @@ func (s *DDSketch) GetValuesAtQuantiles(quantiles []float64) ([]float64, error) 
 // Return the total number of values that have been added to this sketch.
 func (s *DDSketch) GetCount() float64 {
 	return s.zeroCount + s.positiveValueStore.TotalCount() + s.negativeValueStore.TotalCount()
+}
+
+// GetZeroCount returns the number of zero values that have been added to this sketch.
+// Note: values that are very small (lower than MinIndexableValue if positive, or higher than -MinIndexableValue if negative)
+// are also mapped to the zero bucket.
+func (s *DDSketch) GetZeroCount() float64 {
+	return s.zeroCount
 }
 
 // Return true iff no value has been added to this sketch.
@@ -247,6 +266,18 @@ func (s *DDSketch) GetSum() (sum float64) {
 	return sum
 }
 
+// GetPositiveValueStore returns the store.Store object that contains the positive
+// values of the sketch.
+func (s *DDSketch) GetPositiveValueStore() store.Store {
+	return s.positiveValueStore
+}
+
+// GetNegativeValueStore returns the store.Store object that contains the negative
+// values of the sketch.
+func (s *DDSketch) GetNegativeValueStore() store.Store {
+	return s.negativeValueStore
+}
+
 // ForEach applies f on the bins of the sketches until f returns true.
 // There is no guarantee on the bin iteration order.
 func (s *DDSketch) ForEach(f func(value, count float64) (stop bool)) {
@@ -288,6 +319,23 @@ func (s *DDSketch) ToProto() *sketchpb.DDSketch {
 	}
 }
 
+func (s *DDSketch) EncodeProto(w io.Writer) {
+	builder := sketchpb.NewDDSketchBuilder(w)
+
+	builder.SetMapping(func(indexMappingBuilder *sketchpb.IndexMappingBuilder) {
+		s.IndexMapping.EncodeProto(indexMappingBuilder)
+	})
+
+	builder.SetZeroCount(s.zeroCount)
+	builder.SetNegativeValues(func(storeBuilder *sketchpb.StoreBuilder) {
+		s.negativeValueStore.EncodeProto(storeBuilder)
+	})
+
+	builder.SetPositiveValues(func(storeBuilder *sketchpb.StoreBuilder) {
+		s.positiveValueStore.EncodeProto(storeBuilder)
+	})
+}
+
 // FromProto builds a new instance of DDSketch based on the provided protobuf representation, using a Dense store.
 func FromProto(pb *sketchpb.DDSketch) (*DDSketch, error) {
 	return FromProtoWithStoreProvider(pb, store.DenseStoreConstructor)
@@ -295,20 +343,22 @@ func FromProto(pb *sketchpb.DDSketch) (*DDSketch, error) {
 
 func FromProtoWithStoreProvider(pb *sketchpb.DDSketch, storeProvider store.Provider) (*DDSketch, error) {
 	positiveValueStore := storeProvider()
-	store.MergeWithProto(positiveValueStore, pb.PositiveValues)
+	if pb.PositiveValues != nil {
+		store.MergeWithProto(positiveValueStore, pb.PositiveValues)
+	}
 	negativeValueStore := storeProvider()
-	store.MergeWithProto(negativeValueStore, pb.NegativeValues)
+	if pb.NegativeValues != nil {
+		store.MergeWithProto(negativeValueStore, pb.NegativeValues)
+	}
 	m, err := mapping.FromProto(pb.Mapping)
 	if err != nil {
 		return nil, err
 	}
 	return &DDSketch{
-		IndexMapping:              m,
-		positiveValueStore:        positiveValueStore,
-		negativeValueStore:        negativeValueStore,
-		zeroCount:                 pb.ZeroCount,
-		minIndexableAbsoluteValue: m.MinIndexableValue(),
-		maxIndexableValue:         m.MaxIndexableValue(),
+		IndexMapping:       m,
+		positiveValueStore: positiveValueStore,
+		negativeValueStore: negativeValueStore,
+		zeroCount:          pb.ZeroCount,
 	}, nil
 }
 
@@ -420,8 +470,6 @@ func (s *DDSketch) decodeAndMergeWith(bb []byte, fallbackDecode func(b *[]byte, 
 	if s.IndexMapping == nil {
 		return errors.New("missing index mapping")
 	}
-	s.minIndexableAbsoluteValue = s.IndexMapping.MinIndexableValue()
-	s.maxIndexableValue = s.IndexMapping.MaxIndexableValue()
 	return nil
 }
 
@@ -484,7 +532,7 @@ func (s *DDSketch) Reweight(w float64) error {
 // statistics. Because of the need to track them exactly, adding and merging
 // operations are slightly more exepensive than those of DDSketch.
 type DDSketchWithExactSummaryStatistics struct {
-	sketch            *DDSketch
+	*DDSketch
 	summaryStatistics *stat.SummaryStatistics
 }
 
@@ -494,20 +542,27 @@ func NewDefaultDDSketchWithExactSummaryStatistics(relativeAccuracy float64) (*DD
 		return nil, err
 	}
 	return &DDSketchWithExactSummaryStatistics{
-		sketch:            sketch,
+		DDSketch:          sketch,
 		summaryStatistics: stat.NewSummaryStatistics(),
 	}, nil
 }
 
 func NewDDSketchWithExactSummaryStatistics(mapping mapping.IndexMapping, storeProvider store.Provider) *DDSketchWithExactSummaryStatistics {
 	return &DDSketchWithExactSummaryStatistics{
-		sketch:            NewDDSketchFromStoreProvider(mapping, storeProvider),
+		DDSketch:          NewDDSketchFromStoreProvider(mapping, storeProvider),
 		summaryStatistics: stat.NewSummaryStatistics(),
 	}
 }
 
-func (s *DDSketchWithExactSummaryStatistics) RelativeAccuracy() float64 {
-	return s.sketch.RelativeAccuracy()
+// NewDDSketchWithExactSummaryStatisticsFromData constructs DDSketchWithExactSummaryStatistics from the provided sketch and exact summary statistics.
+func NewDDSketchWithExactSummaryStatisticsFromData(sketch *DDSketch, summaryStatistics *stat.SummaryStatistics) (*DDSketchWithExactSummaryStatistics, error) {
+	if sketch.IsEmpty() != (summaryStatistics.Count() == 0) {
+		return nil, errors.New("sketch and summary statistics do not match")
+	}
+	return &DDSketchWithExactSummaryStatistics{
+		DDSketch:          sketch,
+		summaryStatistics: summaryStatistics,
+	}, nil
 }
 
 func (s *DDSketchWithExactSummaryStatistics) IsEmpty() bool {
@@ -518,26 +573,45 @@ func (s *DDSketchWithExactSummaryStatistics) GetCount() float64 {
 	return s.summaryStatistics.Count()
 }
 
+// GetZeroCount returns the number of zero values that have been added to this sketch.
+// Note: values that are very small (lower than MinIndexableValue if positive, or higher than -MinIndexableValue if negative)
+// are also mapped to the zero bucket.
+func (s *DDSketchWithExactSummaryStatistics) GetZeroCount() float64 {
+	return s.DDSketch.zeroCount
+}
+
 func (s *DDSketchWithExactSummaryStatistics) GetSum() float64 {
 	return s.summaryStatistics.Sum()
 }
 
+// GetPositiveValueStore returns the store.Store object that contains the positive
+// values of the sketch.
+func (s *DDSketchWithExactSummaryStatistics) GetPositiveValueStore() store.Store {
+	return s.DDSketch.positiveValueStore
+}
+
+// GetNegativeValueStore returns the store.Store object that contains the negative
+// values of the sketch.
+func (s *DDSketchWithExactSummaryStatistics) GetNegativeValueStore() store.Store {
+	return s.DDSketch.negativeValueStore
+}
+
 func (s *DDSketchWithExactSummaryStatistics) GetMinValue() (float64, error) {
-	if s.sketch.IsEmpty() {
+	if s.DDSketch.IsEmpty() {
 		return math.NaN(), errEmptySketch
 	}
 	return s.summaryStatistics.Min(), nil
 }
 
 func (s *DDSketchWithExactSummaryStatistics) GetMaxValue() (float64, error) {
-	if s.sketch.IsEmpty() {
+	if s.DDSketch.IsEmpty() {
 		return math.NaN(), errEmptySketch
 	}
 	return s.summaryStatistics.Max(), nil
 }
 
 func (s *DDSketchWithExactSummaryStatistics) GetValueAtQuantile(quantile float64) (float64, error) {
-	value, err := s.sketch.GetValueAtQuantile(quantile)
+	value, err := s.DDSketch.GetValueAtQuantile(quantile)
 	min := s.summaryStatistics.Min()
 	if value < min {
 		return min, err
@@ -550,7 +624,7 @@ func (s *DDSketchWithExactSummaryStatistics) GetValueAtQuantile(quantile float64
 }
 
 func (s *DDSketchWithExactSummaryStatistics) GetValuesAtQuantiles(quantiles []float64) ([]float64, error) {
-	values, err := s.sketch.GetValuesAtQuantiles(quantiles)
+	values, err := s.DDSketch.GetValuesAtQuantiles(quantiles)
 	min := s.summaryStatistics.Min()
 	max := s.summaryStatistics.Max()
 	for i := range values {
@@ -564,16 +638,16 @@ func (s *DDSketchWithExactSummaryStatistics) GetValuesAtQuantiles(quantiles []fl
 }
 
 func (s *DDSketchWithExactSummaryStatistics) ForEach(f func(value, count float64) (stop bool)) {
-	s.sketch.ForEach(f)
+	s.DDSketch.ForEach(f)
 }
 
 func (s *DDSketchWithExactSummaryStatistics) Clear() {
-	s.sketch.Clear()
+	s.DDSketch.Clear()
 	s.summaryStatistics.Clear()
 }
 
 func (s *DDSketchWithExactSummaryStatistics) Add(value float64) error {
-	err := s.sketch.Add(value)
+	err := s.DDSketch.Add(value)
 	if err != nil {
 		return err
 	}
@@ -585,7 +659,7 @@ func (s *DDSketchWithExactSummaryStatistics) AddWithCount(value, count float64) 
 	if count == 0 {
 		return nil
 	}
-	err := s.sketch.AddWithCount(value, count)
+	err := s.DDSketch.AddWithCount(value, count)
 	if err != nil {
 		return err
 	}
@@ -594,7 +668,7 @@ func (s *DDSketchWithExactSummaryStatistics) AddWithCount(value, count float64) 
 }
 
 func (s *DDSketchWithExactSummaryStatistics) MergeWith(o *DDSketchWithExactSummaryStatistics) error {
-	err := s.sketch.MergeWith(o.sketch)
+	err := s.DDSketch.MergeWith(o.DDSketch)
 	if err != nil {
 		return err
 	}
@@ -604,13 +678,13 @@ func (s *DDSketchWithExactSummaryStatistics) MergeWith(o *DDSketchWithExactSumma
 
 func (s *DDSketchWithExactSummaryStatistics) Copy() *DDSketchWithExactSummaryStatistics {
 	return &DDSketchWithExactSummaryStatistics{
-		sketch:            s.sketch.Copy(),
+		DDSketch:          s.DDSketch.Copy(),
 		summaryStatistics: s.summaryStatistics.Copy(),
 	}
 }
 
 func (s *DDSketchWithExactSummaryStatistics) Reweight(factor float64) error {
-	err := s.sketch.Reweight(factor)
+	err := s.DDSketch.Reweight(factor)
 	if err != nil {
 		return err
 	}
@@ -622,7 +696,7 @@ func (s *DDSketchWithExactSummaryStatistics) ChangeMapping(newMapping mapping.In
 	summaryStatisticsCopy := s.summaryStatistics.Copy()
 	summaryStatisticsCopy.Rescale(scaleFactor)
 	return &DDSketchWithExactSummaryStatistics{
-		sketch:            s.sketch.ChangeMapping(newMapping, storeProvider(), storeProvider(), scaleFactor),
+		DDSketch:          s.DDSketch.ChangeMapping(newMapping, storeProvider(), storeProvider(), scaleFactor),
 		summaryStatistics: summaryStatisticsCopy,
 	}
 }
@@ -644,7 +718,7 @@ func (s *DDSketchWithExactSummaryStatistics) Encode(b *[]byte, omitIndexMapping 
 		enc.EncodeFlag(b, enc.FlagMax)
 		enc.EncodeFloat64LE(b, s.summaryStatistics.Max())
 	}
-	s.sketch.Encode(b, omitIndexMapping)
+	s.DDSketch.Encode(b, omitIndexMapping)
 }
 
 // DecodeDDSketchWithExactSummaryStatistics deserializes a sketch.
@@ -664,7 +738,7 @@ func (s *DDSketchWithExactSummaryStatistics) Encode(b *[]byte, omitIndexMapping 
 // it is empty), because it does not track exact summary statistics
 func DecodeDDSketchWithExactSummaryStatistics(b []byte, storeProvider store.Provider, indexMapping mapping.IndexMapping) (*DDSketchWithExactSummaryStatistics, error) {
 	s := &DDSketchWithExactSummaryStatistics{
-		sketch: &DDSketch{
+		DDSketch: &DDSketch{
 			IndexMapping:       indexMapping,
 			positiveValueStore: storeProvider(),
 			negativeValueStore: storeProvider(),
@@ -677,7 +751,7 @@ func DecodeDDSketchWithExactSummaryStatistics(b []byte, storeProvider store.Prov
 }
 
 func (s *DDSketchWithExactSummaryStatistics) DecodeAndMergeWith(bb []byte) error {
-	err := s.sketch.decodeAndMergeWith(bb, func(b *[]byte, flag enc.Flag) error {
+	err := s.DDSketch.decodeAndMergeWith(bb, func(b *[]byte, flag enc.Flag) error {
 		switch flag {
 		case enc.FlagCount:
 			count, err := enc.DecodeVarfloat64(b)
@@ -709,7 +783,7 @@ func (s *DDSketchWithExactSummaryStatistics) DecodeAndMergeWith(bb []byte) error
 	}
 	// It is assumed that if the count is encoded, other exact summary
 	// statistics are encoded as well, which is the case if Encode is used.
-	if s.summaryStatistics.Count() == 0 && !s.sketch.IsEmpty() {
+	if s.summaryStatistics.Count() == 0 && !s.DDSketch.IsEmpty() {
 		return errors.New("missing exact summary statistics")
 	}
 	return nil

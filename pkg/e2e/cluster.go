@@ -53,7 +53,6 @@ func (cl *Cluster) SetUp() {
 
 	cl.StartEtcd()
 	cl.StartApiServer()
-	cl.StartKubelet()
 
 	cl.WaitForApiServer()
 }
@@ -62,7 +61,6 @@ func (cl *Cluster) SetUp() {
 func (cl *Cluster) TearDown() {
 	Log.Logf("Teardown")
 
-	cl.StopKubelet()
 	cl.StopApiServer()
 	cl.StopEtcd()
 }
@@ -131,10 +129,10 @@ func (cl *Cluster) StartApiServer() {
 		"--net=host",
 		"--pid=host",
 		cl.HyperkubeImage,
-		"/hyperkube", "apiserver",
+		"kube-apiserver",
 		"--insecure-bind-address=0.0.0.0",
 		"--service-cluster-ip-range=10.0.0.1/24",
-		"--etcd_servers=http://127.0.0.1:2379",
+		"--etcd-servers=http://127.0.0.1:2379",
 		"--v=2")
 }
 

@@ -170,9 +170,10 @@ func (s *DenseStore) MergeWith(other Store) {
 	}
 	o, ok := other.(*DenseStore)
 	if !ok {
-		for bin := range other.Bins() {
-			s.AddBin(bin)
-		}
+		other.ForEach(func(index int, count float64) (stop bool) {
+			s.AddWithCount(index, count)
+			return false
+		})
 		return
 	}
 	if o.minIndex < s.minIndex || o.maxIndex > s.maxIndex {
@@ -247,6 +248,17 @@ func (s *DenseStore) ToProto() *sketchpb.Store {
 		ContiguousBinCounts:      bins,
 		ContiguousBinIndexOffset: int32(s.minIndex),
 	}
+}
+
+func (s *DenseStore) EncodeProto(builder *sketchpb.StoreBuilder) {
+	if s.IsEmpty() {
+		return
+	}
+
+	for i := s.minIndex - s.offset; i < s.maxIndex-s.offset+1; i++ {
+		builder.AddContiguousBinCounts(s.bins[i])
+	}
+	builder.SetContiguousBinIndexOffset(int32(s.minIndex))
 }
 
 func (s *DenseStore) Reweight(w float64) error {

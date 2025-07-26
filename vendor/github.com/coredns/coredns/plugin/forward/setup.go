@@ -4,7 +4,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coredns/caddy"
@@ -12,13 +14,16 @@ import (
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/dnstap"
 	"github.com/coredns/coredns/plugin/pkg/parse"
+	"github.com/coredns/coredns/plugin/pkg/proxy"
 	pkgtls "github.com/coredns/coredns/plugin/pkg/tls"
 	"github.com/coredns/coredns/plugin/pkg/transport"
 
 	"github.com/miekg/dns"
 )
 
-func init() { plugin.Register("forward", setup) }
+func init() {
+	plugin.Register("forward", setup)
+}
 
 func setup(c *caddy.Controller) error {
 	fs, err := parseForward(c)
@@ -51,9 +56,7 @@ func setup(c *caddy.Controller) error {
 		})
 		c.OnStartup(func() error {
 			if taph := dnsserver.GetConfig(c).Handler("dnstap"); taph != nil {
-				if tapPlugin, ok := taph.(dnstap.Dnstap); ok {
-					f.tapPlugin = &tapPlugin
-				}
+				f.SetTapPlugin(taph.(*dnstap.Dnstap))
 			}
 			return nil
 		})
@@ -69,7 +72,7 @@ func setup(c *caddy.Controller) error {
 // OnStartup starts a goroutines for all proxies.
 func (f *Forward) OnStartup() (err error) {
 	for _, p := range f.proxies {
-		p.start(f.hcInterval)
+		p.Start(f.hcInterval)
 	}
 	return nil
 }
@@ -77,7 +80,7 @@ func (f *Forward) OnStartup() (err error) {
 // OnShutdown stops all configured proxies.
 func (f *Forward) OnShutdown() error {
 	for _, p := range f.proxies {
-		p.stop()
+		p.Stop()
 	}
 	return nil
 }
@@ -129,7 +132,7 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 		if !allowedTrans[trans] {
 			return f, fmt.Errorf("'%s' is not supported as a destination protocol in forward: %s", trans, host)
 		}
-		p := NewProxy(h, trans)
+		p := proxy.NewProxy("forward", h, trans)
 		f.proxies = append(f.proxies, p)
 		transports[i] = trans
 	}
@@ -154,25 +157,26 @@ func parseStanza(c *caddy.Controller) (*Forward, error) {
 			f.proxies[i].SetTLSConfig(f.tlsConfig)
 		}
 		f.proxies[i].SetExpire(f.expire)
-		f.proxies[i].health.SetRecursionDesired(f.opts.hcRecursionDesired)
+		f.proxies[i].GetHealthchecker().SetRecursionDesired(f.opts.HCRecursionDesired)
 		// when TLS is used, checks are set to tcp-tls
-		if f.opts.forceTCP && transports[i] != transport.TLS {
-			f.proxies[i].health.SetTCPTransport()
+		if f.opts.ForceTCP && transports[i] != transport.TLS {
+			f.proxies[i].GetHealthchecker().SetTCPTransport()
 		}
-		f.proxies[i].health.SetDomain(f.opts.hcDomain)
+		f.proxies[i].GetHealthchecker().SetDomain(f.opts.HCDomain)
 	}
 
 	return f, nil
 }
 
 func parseBlock(c *caddy.Controller, f *Forward) error {
+	config := dnsserver.GetConfig(c)
 	switch c.Val() {
 	case "except":
 		ignore := c.RemainingArgs()
 		if len(ignore) == 0 {
 			return c.ArgErr()
 		}
-		for i := 0; i < len(ignore); i++ {
+		for i := range ignore {
 			f.ignored = append(f.ignored, plugin.Host(ignore[i]).NormalizeExact()...)
 		}
 	case "max_fails":
@@ -196,12 +200,12 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 			return fmt.Errorf("health_check can't be negative: %d", dur)
 		}
 		f.hcInterval = dur
-		f.opts.hcDomain = "."
+		f.opts.HCDomain = "."
 
 		for c.NextArg() {
 			switch hcOpts := c.Val(); hcOpts {
 			case "no_rec":
-				f.opts.hcRecursionDesired = false
+				f.opts.HCRecursionDesired = false
 			case "domain":
 				if !c.NextArg() {
 					return c.ArgErr()
@@ -210,7 +214,7 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 				if _, ok := dns.IsDomainName(hcDomain); !ok {
 					return fmt.Errorf("health_check: invalid domain name %s", hcDomain)
 				}
-				f.opts.hcDomain = plugin.Name(hcDomain).Normalize()
+				f.opts.HCDomain = plugin.Name(hcDomain).Normalize()
 			default:
 				return fmt.Errorf("health_check: unknown option %s", hcOpts)
 			}
@@ -220,18 +224,23 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 		if c.NextArg() {
 			return c.ArgErr()
 		}
-		f.opts.forceTCP = true
+		f.opts.ForceTCP = true
 	case "prefer_udp":
 		if c.NextArg() {
 			return c.ArgErr()
 		}
-		f.opts.preferUDP = true
+		f.opts.PreferUDP = true
 	case "tls":
 		args := c.RemainingArgs()
 		if len(args) > 3 {
 			return c.ArgErr()
 		}
 
+		for i := range args {
+			if !filepath.IsAbs(args[i]) && config.Root != "" {
+				args[i] = filepath.Join(config.Root, args[i])
+			}
+		}
 		tlsConfig, err := pkgtls.NewTLSConfigFromArgs(args...)
 		if err != nil {
 			return err
@@ -281,7 +290,28 @@ func parseBlock(c *caddy.Controller, f *Forward) error {
 		}
 		f.ErrLimitExceeded = errors.New("concurrent queries exceeded maximum " + c.Val())
 		f.maxConcurrent = int64(n)
+	case "next":
+		args := c.RemainingArgs()
+		if len(args) == 0 {
+			return c.ArgErr()
+		}
 
+		for _, rcode := range args {
+			var rc int
+			var ok bool
+
+			if rc, ok = dns.StringToRcode[strings.ToUpper(rcode)]; !ok {
+				return fmt.Errorf("%s is not a valid rcode", rcode)
+			}
+
+			f.nextAlternateRcodes = append(f.nextAlternateRcodes, rc)
+		}
+	case "failfast_all_unhealthy_upstreams":
+		args := c.RemainingArgs()
+		if len(args) != 0 {
+			return c.ArgErr()
+		}
+		f.failfastUnhealthyUpstreams = true
 	default:
 		return c.Errf("unknown property '%s'", c.Val())
 	}
